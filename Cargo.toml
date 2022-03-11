@@ -1,0 +1,23 @@
+[package]
+authors = ["ihciah <ihciah@gmail.com>"]
+categories = ["asynchronous"]
+description = "Singleflight in async style."
+edition = "2021"
+keywords = ["async", "singleflight"]
+license = "MIT/Apache-2.0"
+name = "singleflight-async"
+readme = "README.md"
+repository = "https://github.com/ihciah/singleflight-async"
+version = "0.1.0"
+
+[dependencies]
+parking_lot = "0.12"
+tokio = {version = "1", default-features = false, features = ["sync", "parking_lot"]}
+
+[dev-dependencies]
+futures-util = "0.3"
+tokio = {version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "parking_lot"]}
+
+[features]
+default = []
+hardware-lock-elision = ["parking_lot/hardware-lock-elision"]
