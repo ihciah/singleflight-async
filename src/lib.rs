@@ -46,25 +46,42 @@ impl<'a> From<Key<'a>> for Cow<'static, str> {
     }
 }
 
+struct Shared<T> {
+    slot: UnsafeCell<Option<T>>,
+    notify: Notify,
+}
+
+unsafe impl<T> Send for Shared<T> where T: Send {}
+unsafe impl<T> Sync for Shared<T> where T: Sync {}
+
+impl<T> Default for Shared<T> {
+    fn default() -> Self {
+        Self {
+            slot: UnsafeCell::new(None),
+            notify: Notify::new(),
+        }
+    }
+}
+
 // BroadcastOnce consists of shared slot and notify.
 #[derive(Clone)]
 struct BroadcastOnce<T> {
-    shared: Arc<(UnsafeCell<Option<T>>, Notify)>,
+    shared: Arc<Shared<T>>,
+}
+
+impl<T> Default for BroadcastOnce<T> {
+    fn default() -> Self {
+        Self {
+            shared: Arc::new(Shared::default()),
+        }
+    }
 }
 
 // After calling BroadcastOnce::waiter we can get a waiter.
 // It's in WaitList.
 struct BroadcastOnceWaiter<T> {
     notified: Notified<'static>,
-    shared: Arc<(UnsafeCell<Option<T>>, Notify)>,
-}
-
-impl<T> Default for BroadcastOnce<T> {
-    fn default() -> Self {
-        Self {
-            shared: Arc::new((UnsafeCell::new(None), Notify::new())),
-        }
-    }
+    shared: Arc<Shared<T>>,
 }
 
 impl<T> std::fmt::Debug for BroadcastOnce<T> {
@@ -81,7 +98,7 @@ impl<T> BroadcastOnce<T> {
     fn waiter(&self) -> BroadcastOnceWaiter<T> {
         // Leak Notify to get a Notified<'static>.
         // It's safe since Notify is behind an Arc and we hold a reference.
-        let notify = unsafe { &*(&self.shared.1 as *const Notify) };
+        let notify = unsafe { &*(&self.shared.notify as *const Notify) };
         BroadcastOnceWaiter {
             notified: notify.notified(),
             shared: self.shared.clone(),
@@ -90,8 +107,8 @@ impl<T> BroadcastOnce<T> {
 
     // Safety: do not call wake multiple times
     unsafe fn wake(&self, value: T) {
-        *self.shared.0.get() = Some(value);
-        self.shared.1.notify_waiters();
+        *self.shared.slot.get() = Some(value);
+        self.shared.notify.notify_waiters();
     }
 }
 
@@ -104,7 +121,7 @@ impl<T> BroadcastOnceWaiter<T> {
         T: Clone,
     {
         self.notified.await;
-        (*self.shared.0.get())
+        (*self.shared.slot.get())
             .clone()
             .expect("value not set unexpectedly")
     }
