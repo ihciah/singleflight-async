@@ -1,15 +1,20 @@
 use std::{
-    borrow::Cow, cell::UnsafeCell, collections::HashMap, future::Future, ops::Deref, sync::Arc,
+    borrow::Cow,
+    collections::HashMap,
+    future::Future,
+    sync::{Arc, Weak},
 };
 
-use parking_lot::{RwLock, RwLockUpgradableReadGuard};
-use tokio::sync::{futures::Notified, Notify};
+use parking_lot::Mutex as SyncMutex;
+use tokio::sync::Mutex;
+
+type SharedMapping<T> = Arc<SyncMutex<HashMap<Cow<'static, str>, BroadcastOnce<T>>>>;
 
 /// SingleFlight represents a class of work and creates a space in which units of work
 /// can be executed with duplicate suppression.
 #[derive(Debug)]
 pub struct SingleFlight<T> {
-    mapping: Arc<RwLock<HashMap<Cow<'static, str>, BroadcastOnce<T>>>>,
+    mapping: SharedMapping<T>,
 }
 
 impl<T> Default for SingleFlight<T> {
@@ -26,13 +31,12 @@ enum Key<'a> {
     MaybeBorrowed(Cow<'a, str>),
 }
 
-impl<'a> Deref for Key<'a> {
-    type Target = Cow<'a, str>;
-
-    fn deref(&self) -> &Self::Target {
+impl<'a> Key<'a> {
+    #[inline]
+    fn as_str(&'a self) -> &'a str {
         match self {
-            Key::Static(cow) => cow,
-            Key::MaybeBorrowed(cow) => cow,
+            Key::Static(cow) => cow.as_ref(),
+            Key::MaybeBorrowed(cow) => cow.as_ref(),
         }
     }
 }
@@ -47,18 +51,13 @@ impl<'a> From<Key<'a>> for Cow<'static, str> {
 }
 
 struct Shared<T> {
-    slot: UnsafeCell<Option<T>>,
-    notify: Notify,
+    slot: Mutex<Option<T>>,
 }
-
-unsafe impl<T> Send for Shared<T> where T: Send {}
-unsafe impl<T> Sync for Shared<T> where T: Sync {}
 
 impl<T> Default for Shared<T> {
     fn default() -> Self {
         Self {
-            slot: UnsafeCell::new(None),
-            notify: Notify::new(),
+            slot: Mutex::new(None),
         }
     }
 }
@@ -66,22 +65,29 @@ impl<T> Default for Shared<T> {
 // BroadcastOnce consists of shared slot and notify.
 #[derive(Clone)]
 struct BroadcastOnce<T> {
-    shared: Arc<Shared<T>>,
+    shared: Weak<Shared<T>>,
 }
 
-impl<T> Default for BroadcastOnce<T> {
-    fn default() -> Self {
-        Self {
-            shared: Arc::new(Shared::default()),
-        }
+impl<T> BroadcastOnce<T> {
+    fn new() -> (Self, Arc<Shared<T>>) {
+        let shared = Arc::new(Shared::default());
+        (
+            Self {
+                shared: Arc::downgrade(&shared),
+            },
+            shared,
+        )
     }
 }
 
 // After calling BroadcastOnce::waiter we can get a waiter.
 // It's in WaitList.
-struct BroadcastOnceWaiter<T> {
-    notified: Notified<'static>,
+struct BroadcastOnceWaiter<T, F> {
+    func: F,
     shared: Arc<Shared<T>>,
+
+    key: Cow<'static, str>,
+    mapping: SharedMapping<T>,
 }
 
 impl<T> std::fmt::Debug for BroadcastOnce<T> {
@@ -90,40 +96,61 @@ impl<T> std::fmt::Debug for BroadcastOnce<T> {
     }
 }
 
+#[allow(clippy::type_complexity)]
 impl<T> BroadcastOnce<T> {
-    fn new() -> Self {
-        Self::default()
+    fn try_waiter<F>(
+        &self,
+        func: F,
+        key: Cow<'static, str>,
+        mapping: SharedMapping<T>,
+    ) -> Result<BroadcastOnceWaiter<T, F>, (F, Cow<'static, str>, SharedMapping<T>)> {
+        let Some(upgraded) = self.shared.upgrade() else {
+            return Err((func, key, mapping));
+        };
+        Ok(BroadcastOnceWaiter {
+            func,
+            shared: upgraded,
+            key,
+            mapping,
+        })
     }
 
-    fn waiter(&self) -> BroadcastOnceWaiter<T> {
-        // Leak Notify to get a Notified<'static>.
-        // It's safe since Notify is behind an Arc and we hold a reference.
-        let notify = unsafe { &*(&self.shared.notify as *const Notify) };
+    #[inline]
+    const fn waiter<F>(
+        shared: Arc<Shared<T>>,
+        func: F,
+        key: Cow<'static, str>,
+        mapping: SharedMapping<T>,
+    ) -> BroadcastOnceWaiter<T, F> {
         BroadcastOnceWaiter {
-            notified: notify.notified(),
-            shared: self.shared.clone(),
+            func,
+            shared,
+            key,
+            mapping,
         }
-    }
-
-    // Safety: do not call wake multiple times
-    unsafe fn wake(&self, value: T) {
-        *self.shared.slot.get() = Some(value);
-        self.shared.notify.notify_waiters();
     }
 }
 
 // We already in WaitList, so wait will be fine, we won't miss
 // anything after Waiter generated.
-impl<T> BroadcastOnceWaiter<T> {
-    // Safety: first call wake, then call wait
-    async unsafe fn wait(self) -> T
-    where
-        T: Clone,
-    {
-        self.notified.await;
-        (*self.shared.slot.get())
-            .clone()
-            .expect("value not set unexpectedly")
+impl<T, F, Fut> BroadcastOnceWaiter<T, F>
+where
+    F: FnOnce() -> Fut,
+    Fut: Future<Output = T>,
+    T: Clone,
+{
+    async fn wait(self) -> T {
+        let mut slot = self.shared.slot.lock().await;
+        if let Some(value) = (*slot).as_ref() {
+            return value.clone();
+        }
+
+        let value = (self.func)().await;
+        *slot = Some(value.clone());
+
+        self.mapping.lock().remove(&self.key);
+
+        value
     }
 }
 
@@ -164,7 +191,6 @@ impl<T> SingleFlight<T> {
         self.work_inner(Key::MaybeBorrowed(key.into()), func)
     }
 
-    #[allow(clippy::await_holding_lock)]
     #[inline]
     fn work_inner<'a, 'b: 'a, F, Fut>(&'a self, key: Key<'b>, func: F) -> impl Future<Output = T>
     where
@@ -172,39 +198,27 @@ impl<T> SingleFlight<T> {
         Fut: Future<Output = T>,
         T: Clone,
     {
-        enum Either<L, R> {
-            Left(L),
-            Right(R),
-        }
-
-        // here the lock does not across await
-        let m = self.mapping.upgradable_read();
-        let val = m.get(key.deref());
-        let either = match val {
+        let owned_mapping = self.mapping.clone();
+        let mut mapping = self.mapping.lock();
+        let val = mapping.get_mut(key.as_str());
+        match val {
             Some(call) => {
-                let waiter = call.waiter();
-                drop(m);
-                Either::Left(waiter)
+                let key: Cow<'static, str> = key.into();
+                let (func, key, owned_mapping) = match call.try_waiter(func, key, owned_mapping) {
+                    Ok(waiter) => return waiter.wait(),
+                    Err(fm) => fm,
+                };
+                let (new_call, shared) = BroadcastOnce::new();
+                *call = new_call;
+                let waiter = BroadcastOnce::waiter(shared, func, key, owned_mapping);
+                waiter.wait()
             }
             None => {
                 let key: Cow<'static, str> = key.into();
-                let call = BroadcastOnce::new();
-                {
-                    let mut m = RwLockUpgradableReadGuard::upgrade(m);
-                    m.insert(key.clone(), call.clone());
-                }
-                Either::Right((key, func(), self.mapping.clone(), call))
-            }
-        };
-        async move {
-            match either {
-                Either::Left(waiter) => unsafe { waiter.wait().await },
-                Either::Right((key, fut, mapping, call)) => {
-                    let output = fut.await;
-                    mapping.write().remove(&key);
-                    unsafe { call.wake(output.clone()) };
-                    output
-                }
+                let (call, shared) = BroadcastOnce::new();
+                mapping.insert(key.clone(), call);
+                let waiter = BroadcastOnce::waiter(shared, func, key, owned_mapping);
+                waiter.wait()
             }
         }
     }
@@ -317,5 +331,31 @@ mod tests {
         assert_eq!(fut_early.await, "Result");
         tokio::time::sleep(Duration::from_millis(50)).await;
         assert_eq!(fut_late.await, "Result");
+    }
+
+    #[tokio::test]
+    async fn cancel() {
+        let group = SingleFlight::new();
+
+        // the executer cancelled and the other awaiter will create a new future and execute.
+        let fut_cancel = group.work_with_owned_key("key".into(), || async {
+            tokio::time::sleep(Duration::from_millis(2000)).await;
+            "Result1".to_string()
+        });
+        let _ = tokio::time::timeout(Duration::from_millis(10), fut_cancel).await;
+        let fut_late = group.work_with_owned_key("key".into(), || async { "Result2".to_string() });
+        assert_eq!(fut_late.await, "Result2");
+
+        // the first executer is slow but not dropped, so the result will be the first ones.
+        let begin = tokio::time::Instant::now();
+        let fut_1 = group.work_with_owned_key("key".into(), || async {
+            tokio::time::sleep(Duration::from_millis(2000)).await;
+            "Result1".to_string()
+        });
+        let fut_2 = group.work_with_owned_key("key".into(), || async { panic!() });
+        let (v1, v2) = tokio::join!(fut_1, fut_2);
+        assert_eq!(v1, "Result1");
+        assert_eq!(v2, "Result1");
+        assert!(begin.elapsed() > Duration::from_millis(1500));
     }
 }

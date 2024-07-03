@@ -9,6 +9,12 @@
 
 [Singleflight](https://github.com/gsquire/singleflight) in async style.
 
+## Key Features
+- Execute an async task only once for the same key at the same time.
+- Cancel safe when the task is dropped.
+- Not requires the future to be `Send`/`Sync`, or `'static`.
+- Works for all kind of runtimes including tokio, monoio, or others.
+
 ## Example
 ```rust
 use singleflight_async::SingleFlight;
@@ -26,10 +32,12 @@ async fn main() {
         }));
     }
 
+    let begin = std::time::Instant::now();
     for fut in futures.into_iter() {
         assert_eq!(fut.await, "my-result");
         println!("task finished");
     }
+    println!("time elapsed: {:?}", begin.elapsed());
 }
 ```
 
@@ -47,4 +55,5 @@ task finished
 task finished
 task finished
 task finished
+time elapsed: 100.901321ms
 ```

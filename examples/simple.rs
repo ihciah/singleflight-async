@@ -13,8 +13,10 @@ async fn main() {
         }));
     }
 
+    let begin = std::time::Instant::now();
     for fut in futures.into_iter() {
         assert_eq!(fut.await, "my-result");
         println!("task finished");
     }
+    println!("time elapsed: {:?}", begin.elapsed());
 }
