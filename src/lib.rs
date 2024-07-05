@@ -1,51 +1,26 @@
 use std::{
-    borrow::Cow,
     collections::HashMap,
     future::Future,
+    hash::Hash,
     sync::{Arc, Weak},
 };
 
 use parking_lot::Mutex as SyncMutex;
 use tokio::sync::Mutex;
 
-type SharedMapping<T> = Arc<SyncMutex<HashMap<Cow<'static, str>, BroadcastOnce<T>>>>;
+type SharedMapping<K, T> = Arc<SyncMutex<HashMap<K, BroadcastOnce<T>>>>;
 
 /// SingleFlight represents a class of work and creates a space in which units of work
 /// can be executed with duplicate suppression.
 #[derive(Debug)]
-pub struct SingleFlight<T> {
-    mapping: SharedMapping<T>,
+pub struct SingleFlight<K, T> {
+    mapping: SharedMapping<K, T>,
 }
 
-impl<T> Default for SingleFlight<T> {
+impl<K, T> Default for SingleFlight<K, T> {
     fn default() -> Self {
         Self {
             mapping: Default::default(),
-        }
-    }
-}
-
-// Key is designed to avoid String clone.
-enum Key<'a> {
-    Static(Cow<'static, str>),
-    MaybeBorrowed(Cow<'a, str>),
-}
-
-impl<'a> Key<'a> {
-    #[inline]
-    fn as_str(&'a self) -> &'a str {
-        match self {
-            Key::Static(cow) => cow.as_ref(),
-            Key::MaybeBorrowed(cow) => cow.as_ref(),
-        }
-    }
-}
-
-impl<'a> From<Key<'a>> for Cow<'static, str> {
-    fn from(k: Key<'a>) -> Self {
-        match k {
-            Key::Static(cow) => cow,
-            Key::MaybeBorrowed(cow) => Cow::Owned(cow.into_owned()),
         }
     }
 }
@@ -62,7 +37,7 @@ impl<T> Default for Shared<T> {
     }
 }
 
-// BroadcastOnce consists of shared slot and notify.
+/// `BroadcastOnce` consists of shared slot and notify.
 #[derive(Clone)]
 struct BroadcastOnce<T> {
     shared: Weak<Shared<T>>,
@@ -82,12 +57,12 @@ impl<T> BroadcastOnce<T> {
 
 // After calling BroadcastOnce::waiter we can get a waiter.
 // It's in WaitList.
-struct BroadcastOnceWaiter<T, F> {
+struct BroadcastOnceWaiter<K, T, F> {
     func: F,
     shared: Arc<Shared<T>>,
 
-    key: Cow<'static, str>,
-    mapping: SharedMapping<T>,
+    key: K,
+    mapping: SharedMapping<K, T>,
 }
 
 impl<T> std::fmt::Debug for BroadcastOnce<T> {
@@ -98,12 +73,12 @@ impl<T> std::fmt::Debug for BroadcastOnce<T> {
 
 #[allow(clippy::type_complexity)]
 impl<T> BroadcastOnce<T> {
-    fn try_waiter<F>(
+    fn try_waiter<K, F>(
         &self,
         func: F,
-        key: Cow<'static, str>,
-        mapping: SharedMapping<T>,
-    ) -> Result<BroadcastOnceWaiter<T, F>, (F, Cow<'static, str>, SharedMapping<T>)> {
+        key: K,
+        mapping: SharedMapping<K, T>,
+    ) -> Result<BroadcastOnceWaiter<K, T, F>, (F, K, SharedMapping<K, T>)> {
         let Some(upgraded) = self.shared.upgrade() else {
             return Err((func, key, mapping));
         };
@@ -116,12 +91,12 @@ impl<T> BroadcastOnce<T> {
     }
 
     #[inline]
-    const fn waiter<F>(
+    const fn waiter<K, F>(
         shared: Arc<Shared<T>>,
         func: F,
-        key: Cow<'static, str>,
-        mapping: SharedMapping<T>,
-    ) -> BroadcastOnceWaiter<T, F> {
+        key: K,
+        mapping: SharedMapping<K, T>,
+    ) -> BroadcastOnceWaiter<K, T, F> {
         BroadcastOnceWaiter {
             func,
             shared,
@@ -133,8 +108,9 @@ impl<T> BroadcastOnce<T> {
 
 // We already in WaitList, so wait will be fine, we won't miss
 // anything after Waiter generated.
-impl<T, F, Fut> BroadcastOnceWaiter<T, F>
+impl<K, T, F, Fut> BroadcastOnceWaiter<K, T, F>
 where
+    K: Hash + Eq,
     F: FnOnce() -> Fut,
     Fut: Future<Output = T>,
     T: Clone,
@@ -154,7 +130,10 @@ where
     }
 }
 
-impl<T> SingleFlight<T> {
+impl<K, T> SingleFlight<K, T>
+where
+    K: Hash + Eq + Clone,
+{
     /// Create a new BroadcastOnce to do work with.
     #[inline]
     pub fn new() -> Self {
@@ -164,35 +143,7 @@ impl<T> SingleFlight<T> {
     /// Execute and return the value for a given function, making sure that only one
     /// operation is in-flight at a given moment. If a duplicate call comes in, that caller will
     /// wait until the original call completes and return the same value.
-    ///
-    /// The key is a Owned key. The performance will be slightly better than `work`.
-    pub fn work_with_owned_key<F, Fut>(
-        &self,
-        key: Cow<'static, str>,
-        func: F,
-    ) -> impl Future<Output = T>
-    where
-        F: FnOnce() -> Fut,
-        Fut: Future<Output = T>,
-        T: Clone,
-    {
-        self.work_inner(Key::Static(key), func)
-    }
-
-    /// Execute and return the value for a given function, making sure that only one
-    /// operation is in-flight at a given moment. If a duplicate call comes in, that caller will
-    /// wait until the original call completes and return the same value.
-    pub fn work<F, Fut>(&self, key: &str, func: F) -> impl Future<Output = T>
-    where
-        F: FnOnce() -> Fut,
-        Fut: Future<Output = T>,
-        T: Clone,
-    {
-        self.work_inner(Key::MaybeBorrowed(key.into()), func)
-    }
-
-    #[inline]
-    fn work_inner<'a, 'b: 'a, F, Fut>(&'a self, key: Key<'b>, func: F) -> impl Future<Output = T>
+    pub fn work<F, Fut>(&self, key: K, func: F) -> impl Future<Output = T>
     where
         F: FnOnce() -> Fut,
         Fut: Future<Output = T>,
@@ -200,10 +151,9 @@ impl<T> SingleFlight<T> {
     {
         let owned_mapping = self.mapping.clone();
         let mut mapping = self.mapping.lock();
-        let val = mapping.get_mut(key.as_str());
+        let val = mapping.get_mut(&key);
         match val {
             Some(call) => {
-                let key: Cow<'static, str> = key.into();
                 let (func, key, owned_mapping) = match call.try_waiter(func, key, owned_mapping) {
                     Ok(waiter) => return waiter.wait(),
                     Err(fm) => fm,
@@ -214,7 +164,6 @@ impl<T> SingleFlight<T> {
                 waiter.wait()
             }
             None => {
-                let key: Cow<'static, str> = key.into();
                 let (call, shared) = BroadcastOnce::new();
                 mapping.insert(key.clone(), call);
                 let waiter = BroadcastOnce::waiter(shared, func, key, owned_mapping);
@@ -300,7 +249,7 @@ mod tests {
     async fn call_with_static_str_key() {
         let group = SingleFlight::new();
         let result = group
-            .work_with_owned_key("key".into(), || async {
+            .work("key".to_string(), || async {
                 tokio::time::sleep(Duration::from_millis(1)).await;
                 "Result".to_string()
             })
@@ -312,7 +261,21 @@ mod tests {
     async fn call_with_static_string_key() {
         let group = SingleFlight::new();
         let result = group
-            .work_with_owned_key("key".to_string().into(), || async {
+            .work("key".to_string(), || async {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+                "Result".to_string()
+            })
+            .await;
+        assert_eq!(result, "Result");
+    }
+
+    #[tokio::test]
+    async fn call_with_custom_key() {
+        #[derive(Clone, PartialEq, Eq, Hash)]
+        struct K(i32);
+        let group = SingleFlight::new();
+        let result = group
+            .work(K(1), || async {
                 tokio::time::sleep(Duration::from_millis(1)).await;
                 "Result".to_string()
             })
@@ -323,11 +286,11 @@ mod tests {
     #[tokio::test]
     async fn late_wait() {
         let group = SingleFlight::new();
-        let fut_early = group.work_with_owned_key("key".into(), || async {
+        let fut_early = group.work("key".to_string(), || async {
             tokio::time::sleep(Duration::from_millis(20)).await;
             "Result".to_string()
         });
-        let fut_late = group.work_with_owned_key("key".into(), || async { panic!("unexpected") });
+        let fut_late = group.work("key".into(), || async { panic!("unexpected") });
         assert_eq!(fut_early.await, "Result");
         tokio::time::sleep(Duration::from_millis(50)).await;
         assert_eq!(fut_late.await, "Result");
@@ -338,21 +301,21 @@ mod tests {
         let group = SingleFlight::new();
 
         // the executer cancelled and the other awaiter will create a new future and execute.
-        let fut_cancel = group.work_with_owned_key("key".into(), || async {
+        let fut_cancel = group.work("key".to_string(), || async {
             tokio::time::sleep(Duration::from_millis(2000)).await;
             "Result1".to_string()
         });
         let _ = tokio::time::timeout(Duration::from_millis(10), fut_cancel).await;
-        let fut_late = group.work_with_owned_key("key".into(), || async { "Result2".to_string() });
+        let fut_late = group.work("key".to_string(), || async { "Result2".to_string() });
         assert_eq!(fut_late.await, "Result2");
 
         // the first executer is slow but not dropped, so the result will be the first ones.
         let begin = tokio::time::Instant::now();
-        let fut_1 = group.work_with_owned_key("key".into(), || async {
+        let fut_1 = group.work("key".to_string(), || async {
             tokio::time::sleep(Duration::from_millis(2000)).await;
             "Result1".to_string()
         });
-        let fut_2 = group.work_with_owned_key("key".into(), || async { panic!() });
+        let fut_2 = group.work("key".to_string(), || async { panic!() });
         let (v1, v2) = tokio::join!(fut_1, fut_2);
         assert_eq!(v1, "Result1");
         assert_eq!(v2, "Result1");
